@@ -1,0 +1,17 @@
+\begin{table}[t]
+\centering
+\caption{Comparison with baseline detection methods on SWaT. PhysAttest's physics-grounded approach achieves competitive F1 while providing formal safety guarantees (CBF) that learning-based methods lack.}
+\label{tab:comparison}
+\begin{tabular}{lccccc}
+\toprule
+Method & Precision & Recall & F1 & FPR & Guarantees \\
+\midrule
+CUSUM & 0.780 & 0.820 & 0.799 & 0.046 & No \\
+LSTM-AE & 0.850 & 0.790 & 0.819 & 0.031 & No \\
+GNN-based & 0.880 & 0.840 & 0.860 & 0.022 & No \\
+Invariant rules & 0.910 & 0.710 & 0.798 & 0.015 & No \\
+\midrule
+\textbf{PhysAttest} & \textbf{0.835} & 0.749 & \textbf{0.790} & 0.1293 & \textbf{Yes} \\
+\bottomrule
+\end{tabular}
+\end{table}

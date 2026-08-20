@@ -1,0 +1,17 @@
+\begin{table}[t]
+\centering
+\caption{Detection performance vs.\ threshold on SWaT dataset (synthetic, 22 sensors, 13 attack scenarios).}
+\label{tab:detection_metrics}
+\begin{tabular}{cccccc}
+\toprule
+$\tau$ & Precision & Recall & F1 & FPR & Latency (s) \\
+\midrule
+2.0 & 0.652 & 0.873 & 0.747 & 0.4119 & 0.7 \\
+2.5 & 0.835 & 0.749 & \textbf{0.790} & 0.1293 & 2.7 \\
+3.0 & 0.959 & 0.641 & 0.769 & 0.0284 & 18.3 \\
+3.5 & 0.993 & 0.538 & 0.698 & 0.0050 & 36.5 \\
+4.0 & 0.999 & 0.522 & 0.686 & 0.0013 & 14.6 \\
+5.0 & 1.000 & 0.472 & 0.641 & 0.0000 & 0.1 \\
+\bottomrule
+\end{tabular}
+\end{table}
