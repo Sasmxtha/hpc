@@ -1,0 +1,4 @@
+requests>=2.31
+numpy>=1.24
+# optional, for the local TinyLlama fallback backend:
+# llama-cpp-python>=0.2
