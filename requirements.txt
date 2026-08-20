@@ -1,0 +1,19 @@
+qiskit>=1.0
+qiskit-ibm-runtime>=0.20
+qiskit-aer>=0.13
+numpy>=1.24
+scipy>=1.10
+scikit-learn>=1.3
+torch>=2.0
+matplotlib>=3.7
+seaborn>=0.12
+
+# PhysAttest dependencies
+cvxpy>=1.4
+langgraph>=0.2
+pandas>=2.0
+pytest>=8.0
+
+# PhysAttest LLM tiers (optional — system works without these)
+groq                        # Tier 1: Groq API (requires GROQ_API_KEY)
+llama-cpp-python            # Tier 2: local TinyLlama on CPU

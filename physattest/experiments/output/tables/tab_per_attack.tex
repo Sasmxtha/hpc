@@ -1,0 +1,24 @@
+\begin{table}[t]
+\centering
+\caption{Per-attack detection at $\tau = 2.5$. Stealth attacks (slow drift) are harder for threshold-based detection alone; active probing and fingerprinting address this gap.}
+\label{tab:per_attack}
+\begin{tabular}{clcccc}
+\toprule
+ID & Attack & Type & Recall & Latency (s) & Category \\
+\midrule
+1 & LIT101 spike+ & overt & 1.000 & 0 \\
+3 & LIT101 spike- & overt & 1.000 & 0 \\
+4 & LIT301 const & overt & 1.000 & 0 \\
+5 & pH spike & overt & 1.000 & 0 \\
+6 & FIT101 zero & overt & 1.000 & 0 \\
+7 & LIT101 drift & stealth & 0.108 & 9 \\
+10 & FIT401 scale & stealth & 0.151 & 12 \\
+16 & LIT301 drift & stealth & 0.139 & 13 \\
+19 & AIT504 spike & overt & 1.000 & 0 \\
+25 & LIT401 overflow & overt & 1.000 & 0 \\
+30 & Multi(LIT+FIT) & coordinated & 0.337 & 1 \\
+31 & Multi(L401+F401) & coordinated & 1.000 & 0 \\
+36 & Multi(3-sensor) & coordinated & 1.000 & 0 \\
+\bottomrule
+\end{tabular}
+\end{table}

@@ -1,242 +1,278 @@
 """
-Data loader for SWaT dataset (real or synthetic).
+SWaT dataset loader.
 
-Handles:
-  - Real SWaT CSV/XLSX files from iTrust
-  - Synthetic CSV files from our generator
-  - Column name normalization (real dataset has spaces in column names)
-  - Train/test splitting by normal/attack periods
-  - Windowing for the observer (sliding windows of sensor readings)
+Handles two modes:
+1. Real SWaT data (CSV from iTrust) — when you have the files
+2. Synthetic SWaT data — realistic simulation for development
 
-Usage:
-    from data.loader import SWaTLoader
+The real SWaT dataset comes as:
+  - SWaT_Dataset_Normal_v1.csv  (7 days normal operation, ~500K rows)
+  - SWaT_Dataset_Attack_v0.csv  (4 days with 36 attacks, ~450K rows)
 
-    loader = SWaTLoader("data/SWaT_Normal_Synthetic.csv")
-    print(loader.info())
-
-    sensors, actuators, labels = loader.get_arrays()
-    for window in loader.sliding_windows(window_size=60):
-        # window is a (60, n_sensors) array — 1 minute of data
-        pass
+Columns: Timestamp, sensor/actuator readings..., Normal/Attack label
+Sampling rate: 1 second
 """
 
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Tuple, Iterator, Optional, List, Dict
-from .swat_columns import SENSOR_COLUMNS, ACTUATOR_COLUMNS, ALL_COLUMNS, ALL_STAGES
+from typing import Optional
+from .swat_config import (
+    ALL_SENSORS, CONTINUOUS_SENSORS, ACTUATORS,
+    LEVEL_SENSORS, FLOW_SENSORS, PRESSURE_SENSORS, CHEMICAL_SENSORS,
+    SWaTPhysics,
+)
 
 
 class SWaTLoader:
     """
-    Loads and preprocesses SWaT data for the observer pipeline.
+    Load and preprocess SWaT dataset for PhysAttest experiments.
+
+    Usage:
+        # With real data:
+        loader = SWaTLoader(data_dir="path/to/swat/csvs")
+        normal, attacks = loader.load()
+
+        # Without real data (synthetic):
+        loader = SWaTLoader()
+        normal, attacks = loader.load_synthetic()
     """
 
-    def __init__(self, filepath: str, max_rows: Optional[int] = None):
+    def __init__(self, data_dir: Optional[str] = None):
+        self.data_dir = Path(data_dir) if data_dir else None
+        self.physics = SWaTPhysics()
+
+    def load(self) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Parameters:
-            filepath: path to CSV or XLSX file
-            max_rows: limit rows loaded (useful for quick testing)
-        """
-        self.filepath = Path(filepath)
-        self.df = self._load(max_rows)
-        self._normalize_columns()
-        self._parse_labels()
-
-    def _load(self, max_rows: Optional[int]) -> pd.DataFrame:
-        """Load CSV or XLSX file."""
-        suffix = self.filepath.suffix.lower()
-        if suffix == ".xlsx":
-            df = pd.read_excel(self.filepath, nrows=max_rows)
-        elif suffix == ".csv":
-            df = pd.read_csv(self.filepath, nrows=max_rows)
-        else:
-            raise ValueError(f"Unsupported file type: {suffix}")
-        return df
-
-    def _normalize_columns(self):
-        """
-        The real SWaT dataset has quirky column names:
-          - Leading/trailing spaces: ' Timestamp ', ' LIT101 '
-          - Some versions use different capitalization
-
-        This normalizes everything to clean names matching our registry.
-        """
-        self.df.columns = [col.strip() for col in self.df.columns]
-
-        rename_map = {}
-        for col in self.df.columns:
-            clean = col.strip().upper()
-            if clean in ALL_STAGES:
-                rename_map[col] = clean
-            elif clean == "TIMESTAMP":
-                rename_map[col] = "Timestamp"
-            elif clean in ("NORMAL/ATTACK", "LABEL", "ATTACK", "NORMAL/ ATTACK"):
-                rename_map[col] = "Normal/Attack"
-
-        self.df.rename(columns=rename_map, inplace=True)
-
-        # Ensure numeric columns are actually numeric
-        for col in ALL_COLUMNS:
-            if col in self.df.columns:
-                self.df[col] = pd.to_numeric(self.df[col], errors="coerce")
-
-    def _parse_labels(self):
-        """Parse the Normal/Attack label column into a boolean attack flag."""
-        if "Normal/Attack" in self.df.columns:
-            self.df["is_attack"] = self.df["Normal/Attack"].str.strip().str.lower() != "normal"
-        else:
-            self.df["is_attack"] = False
-
-    def info(self) -> str:
-        """Print a summary of the loaded dataset."""
-        n_rows = len(self.df)
-        hours = n_rows / 3600
-
-        available_sensors = [c for c in SENSOR_COLUMNS if c in self.df.columns]
-        available_actuators = [c for c in ACTUATOR_COLUMNS if c in self.df.columns]
-        missing = [c for c in ALL_COLUMNS if c not in self.df.columns]
-
-        n_attack = self.df["is_attack"].sum() if "is_attack" in self.df.columns else 0
-
-        lines = [
-            f"Dataset: {self.filepath.name}",
-            f"Rows: {n_rows:,} ({hours:.1f} hours at 1 Hz)",
-            f"Sensors: {len(available_sensors)}/{len(SENSOR_COLUMNS)}",
-            f"Actuators: {len(available_actuators)}/{len(ACTUATOR_COLUMNS)}",
-            f"Attack rows: {n_attack:,} ({n_attack/n_rows*100:.1f}%)" if n_rows > 0 else "",
-        ]
-        if missing:
-            lines.append(f"Missing columns: {', '.join(missing[:10])}" +
-                         (f" (+{len(missing)-10} more)" if len(missing) > 10 else ""))
-        return "\n".join(lines)
-
-    def get_arrays(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Get sensor readings, actuator states, and labels as numpy arrays.
+        Load real SWaT CSV files.
 
         Returns:
-            sensors:   (n_timesteps, n_sensors) float array
-            actuators: (n_timesteps, n_actuators) float array
-            labels:    (n_timesteps,) boolean array (True = attack)
+            (normal_df, attack_df) — both with standardised column names
         """
-        available_sensors = [c for c in SENSOR_COLUMNS if c in self.df.columns]
-        available_actuators = [c for c in ACTUATOR_COLUMNS if c in self.df.columns]
+        if self.data_dir is None:
+            raise FileNotFoundError(
+                "No data directory specified. Use load_synthetic() for development, "
+                "or provide data_dir pointing to the SWaT CSV files from iTrust."
+            )
 
-        sensors = self.df[available_sensors].values.astype(np.float64)
-        actuators = self.df[available_actuators].values.astype(np.float64)
-        labels = self.df["is_attack"].values if "is_attack" in self.df.columns else np.zeros(len(self.df), dtype=bool)
+        normal_path = self._find_file("Normal")
+        attack_path = self._find_file("Attack")
 
-        # Replace NaN with forward fill then zero
-        sensors = pd.DataFrame(sensors).ffill().fillna(0).values
-        actuators = pd.DataFrame(actuators).ffill().fillna(0).values
+        normal_df = self._load_csv(normal_path)
+        attack_df = self._load_csv(attack_path)
 
-        return sensors, actuators, labels
+        return normal_df, attack_df
 
-    def get_sensor_names(self) -> List[str]:
-        """Return list of available sensor column names."""
-        return [c for c in SENSOR_COLUMNS if c in self.df.columns]
+    def _find_file(self, pattern: str) -> Path:
+        """Find the CSV file matching a pattern."""
+        candidates = list(self.data_dir.glob(f"*{pattern}*.csv"))
+        if not candidates:
+            candidates = list(self.data_dir.glob(f"*{pattern.lower()}*.csv"))
+        if not candidates:
+            raise FileNotFoundError(
+                f"No CSV file matching '*{pattern}*' in {self.data_dir}"
+            )
+        return candidates[0]
 
-    def get_actuator_names(self) -> List[str]:
-        """Return list of available actuator column names."""
-        return [c for c in ACTUATOR_COLUMNS if c in self.df.columns]
+    def _load_csv(self, path: Path) -> pd.DataFrame:
+        """Load and standardise a SWaT CSV file."""
+        df = pd.read_csv(path)
 
-    def get_normal_data(self) -> pd.DataFrame:
-        """Return only normal (non-attack) rows."""
-        return self.df[~self.df["is_attack"]].copy()
+        # Standardise column names (strip whitespace, handle variations)
+        df.columns = [c.strip().replace(" ", "") for c in df.columns]
 
-    def get_attack_data(self) -> pd.DataFrame:
-        """Return only attack rows."""
-        return self.df[self.df["is_attack"]].copy()
+        # Parse timestamp
+        for col in ["Timestamp", "timestamp", "DateTime"]:
+            if col in df.columns:
+                df["timestamp"] = pd.to_datetime(df[col])
+                break
 
-    def get_attack_periods(self) -> List[Dict]:
-        """
-        Find contiguous attack periods with start/end indices.
+        # Parse attack label
+        for col in ["Normal/Attack", "Attack", "Label", "label"]:
+            if col in df.columns:
+                df["is_attack"] = df[col].str.strip().str.lower().isin(
+                    ["attack", "a", "1", "true"]
+                )
+                break
 
-        Returns list of dicts with:
-            start: first attack row index
-            end: last attack row index
-            duration: length in seconds
-            label: attack label string
-        """
-        if "is_attack" not in self.df.columns:
-            return []
+        if "is_attack" not in df.columns:
+            df["is_attack"] = False
 
-        attacks = self.df["is_attack"].values
-        periods = []
-        in_attack = False
-        start = 0
+        # Convert numeric columns
+        for col in df.columns:
+            if col not in ["timestamp", "is_attack"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        for i in range(len(attacks)):
-            if attacks[i] and not in_attack:
-                start = i
-                in_attack = True
-            elif not attacks[i] and in_attack:
-                label_col = self.df["Normal/Attack"].iloc[start] if "Normal/Attack" in self.df.columns else "Attack"
-                periods.append({
-                    "start": start,
-                    "end": i - 1,
-                    "duration": i - start,
-                    "label": str(label_col).strip(),
-                })
-                in_attack = False
+        return df
 
-        if in_attack:
-            label_col = self.df["Normal/Attack"].iloc[start] if "Normal/Attack" in self.df.columns else "Attack"
-            periods.append({
-                "start": start,
-                "end": len(attacks) - 1,
-                "duration": len(attacks) - start,
-                "label": str(label_col).strip(),
-            })
-
-        return periods
-
-    def sliding_windows(
+    def load_synthetic(
         self,
-        window_size: int = 60,
-        step: int = 1,
-        sensors_only: bool = True,
-    ) -> Iterator[Tuple[np.ndarray, np.ndarray, int]]:
+        n_normal: int = 10000,
+        n_attack: int = 5000,
+        seed: int = 42,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Yield sliding windows of data for the observer.
+        Generate realistic synthetic SWaT data for development.
 
-        Parameters:
-            window_size: number of timesteps per window
-            step: stride between windows
-            sensors_only: if True, yield only sensor data; else include actuators
-
-        Yields:
-            (window_data, window_labels, start_index)
+        Models the 6 sub-processes with:
+        - Realistic steady-state values and noise levels
+        - Mass/flow conservation between processes
+        - 15 attack scenarios matching the real SWaT catalogue
         """
-        sensors, actuators, labels = self.get_arrays()
-        data = sensors if sensors_only else np.hstack([sensors, actuators])
+        rng = np.random.default_rng(seed)
 
-        for i in range(0, len(data) - window_size + 1, step):
-            yield data[i:i + window_size], labels[i:i + window_size], i
+        # --- Normal data ---
+        normal = self._generate_normal(n_normal, rng)
 
-    def compute_statistics(self, normal_only: bool = True) -> pd.DataFrame:
-        """
-        Compute per-sensor statistics (used for threshold calibration).
+        # --- Attack data ---
+        attack = self._generate_attacks(n_attack, rng)
 
-        Parameters:
-            normal_only: if True, compute stats only from normal data
-        """
-        df = self.get_normal_data() if normal_only else self.df
-        available = [c for c in SENSOR_COLUMNS if c in df.columns]
+        return normal, attack
 
-        stats = []
-        for col in available:
-            vals = df[col].dropna()
-            stats.append({
-                "sensor": col,
-                "mean": vals.mean(),
-                "std": vals.std(),
-                "min": vals.min(),
-                "max": vals.max(),
-                "median": vals.median(),
-                "q1": vals.quantile(0.25),
-                "q3": vals.quantile(0.75),
-            })
+    def _generate_normal(self, n: int, rng) -> pd.DataFrame:
+        """Generate normal operation data with realistic dynamics."""
+        t = np.arange(n, dtype=float)
+        data = {}
 
-        return pd.DataFrame(stats).set_index("sensor")
+        # P1: Raw water — tank fills and drains cyclically
+        lit101_base = 500 + 100 * np.sin(2 * np.pi * t / 3600)  # 1hr cycle
+        data["LIT101"] = lit101_base + rng.normal(0, 2, n)
+        data["FIT101"] = 1.5 + 0.3 * np.sin(2 * np.pi * t / 3600 + 0.5) + rng.normal(0, 0.05, n)
+        data["MV101"] = (np.sin(2 * np.pi * t / 3600) > 0).astype(float)
+        data["P101"] = (data["LIT101"] > 400).astype(float)
+        data["P102"] = (data["LIT101"] > 600).astype(float)
+
+        # P2: Pre-treatment — chemical dosing
+        data["FIT201"] = data["FIT101"] * 0.95 + rng.normal(0, 0.03, n)
+        data["AIT201"] = 200 + rng.normal(0, 5, n)     # conductivity
+        data["AIT202"] = 7.2 + rng.normal(0, 0.1, n)   # pH
+        data["AIT203"] = 250 + rng.normal(0, 10, n)     # ORP
+        for s in ["MV201", "P201", "P202", "P203", "P204", "P205", "P206"]:
+            data[s] = rng.choice([0.0, 1.0, 2.0], n)
+
+        # P3: UF — pressure-flow dynamics
+        data["LIT301"] = 600 + 80 * np.sin(2 * np.pi * t / 2400) + rng.normal(0, 3, n)
+        data["FIT301"] = data["FIT201"] * 0.9 + rng.normal(0, 0.04, n)
+        data["DPIT301"] = 20 + 5 * (data["FIT301"] / 2.0) + rng.normal(0, 0.5, n)
+        for s in ["MV301", "MV302", "MV303", "MV304", "P301", "P302"]:
+            data[s] = rng.choice([0.0, 1.0, 2.0], n)
+
+        # P4: De-chlorination
+        data["LIT401"] = 500 + 60 * np.sin(2 * np.pi * t / 1800) + rng.normal(0, 2, n)
+        data["FIT401"] = data["FIT301"] * 0.85 + rng.normal(0, 0.03, n)
+        data["AIT401"] = 180 + rng.normal(0, 5, n)
+        data["AIT402"] = 7.0 + rng.normal(0, 0.08, n)
+        for s in ["P401", "P402", "P403", "P404", "UV401"]:
+            data[s] = rng.choice([0.0, 1.0, 2.0], n)
+
+        # P5: RO — membrane dynamics
+        data["FIT501"] = data["FIT401"] * 0.8 + rng.normal(0, 0.02, n)
+        data["FIT502"] = data["FIT501"] * 0.75 + rng.normal(0, 0.02, n)  # permeate
+        data["FIT503"] = data["FIT501"] * 0.25 + rng.normal(0, 0.01, n)  # concentrate
+        data["FIT504"] = data["FIT502"] + rng.normal(0, 0.01, n)
+        data["AIT501"] = 250 + rng.normal(0, 8, n)
+        data["AIT502"] = 7.1 + rng.normal(0, 0.1, n)
+        data["AIT503"] = 280 + rng.normal(0, 10, n)
+        data["AIT504"] = 150 + rng.normal(0, 5, n)  # permeate: lower conductivity
+        for s in ["MV501", "MV502", "MV503", "MV504", "P501", "P502"]:
+            data[s] = rng.choice([0.0, 1.0, 2.0], n)
+
+        # P6: Backwash
+        data["FIT601"] = data["FIT503"] * 0.3 + rng.normal(0, 0.01, n)
+        for s in ["P601", "P602", "P603"]:
+            data[s] = rng.choice([0.0, 1.0], n)
+
+        df = pd.DataFrame(data)
+        df["timestamp"] = pd.date_range("2024-01-01", periods=n, freq="1s")
+        df["is_attack"] = False
+        df["attack_id"] = 0
+
+        return df
+
+    def _generate_attacks(self, n: int, rng) -> pd.DataFrame:
+        """Generate attack data with labelled attack windows."""
+        # Start with normal data as baseline
+        normal = self._generate_normal(n, rng)
+
+        attacks = normal.copy()
+        attacks["is_attack"] = False
+        attacks["attack_id"] = 0
+
+        attack_window = n // 15  # ~15 attacks spread across the data
+
+        attack_defs = [
+            # (attack_id, target_sensor, injection_fn)
+            (1,  "LIT101", lambda v, t: v + 200),                    # spike high
+            (3,  "LIT101", lambda v, t: v - 300),                    # spike low
+            (4,  "LIT301", lambda v, t: np.full_like(v, 200.0)),     # constant low
+            (5,  "AIT202", lambda v, t: v + 3.0),                    # pH spike
+            (6,  "FIT101", lambda v, t: np.full_like(v, 0.0)),       # zero flow
+            (7,  "LIT101", lambda v, t: v - t * 0.05),               # slow drift down
+            (10, "FIT401", lambda v, t: v * 1.5),                    # scale up
+            (16, "LIT301", lambda v, t: v + t * 0.03),               # slow drift up
+            (19, "AIT504", lambda v, t: v + 100),                    # conductivity spike
+            (25, "LIT401", lambda v, t: np.full_like(v, 900.0)),     # overflow attempt
+        ]
+
+        # Multi-sensor coordinated attacks
+        multi_attacks = [
+            (30, ["LIT101", "FIT101"], [lambda v, t: v + 200, lambda v, t: v * 0.5]),
+            (31, ["LIT401", "FIT401"], [lambda v, t: v - 200, lambda v, t: v * 1.5]),
+            (36, ["LIT301", "FIT301", "DPIT301"], [
+                lambda v, t: v + 150,
+                lambda v, t: np.full_like(v, 0.5),
+                lambda v, t: v + 20,
+            ]),
+        ]
+
+        # Apply single-sensor attacks
+        for i, (atk_id, sensor, inject_fn) in enumerate(attack_defs):
+            start = i * attack_window + attack_window // 4
+            end = min(start + attack_window // 2, n)
+            if end <= start or start >= n:
+                continue
+
+            window = slice(start, end)
+            t_local = np.arange(end - start, dtype=float)
+            original = attacks.loc[attacks.index[window], sensor].values
+
+            attacks.loc[attacks.index[window], sensor] = inject_fn(original, t_local)
+            attacks.loc[attacks.index[window], "is_attack"] = True
+            attacks.loc[attacks.index[window], "attack_id"] = atk_id
+
+        # Apply multi-sensor attacks
+        for i, (atk_id, sensors, fns) in enumerate(multi_attacks):
+            start = (len(attack_defs) + i) * attack_window + attack_window // 4
+            end = min(start + attack_window // 2, n)
+            if end <= start or start >= n:
+                continue
+
+            window = slice(start, end)
+            t_local = np.arange(end - start, dtype=float)
+
+            for sensor, fn in zip(sensors, fns):
+                original = attacks.loc[attacks.index[window], sensor].values
+                attacks.loc[attacks.index[window], sensor] = fn(original, t_local)
+
+            attacks.loc[attacks.index[window], "is_attack"] = True
+            attacks.loc[attacks.index[window], "attack_id"] = atk_id
+
+        return attacks
+
+    def get_sensor_readings(self, df: pd.DataFrame) -> np.ndarray:
+        """Extract continuous sensor readings as numpy array."""
+        cols = [c for c in CONTINUOUS_SENSORS if c in df.columns]
+        return df[cols].values
+
+    def get_actuator_states(self, df: pd.DataFrame) -> np.ndarray:
+        """Extract actuator states as numpy array."""
+        cols = [c for c in ACTUATORS if c in df.columns]
+        return df[cols].values
+
+    def get_labels(self, df: pd.DataFrame) -> np.ndarray:
+        """Extract binary attack labels."""
+        return df["is_attack"].values.astype(bool)
+
+    def get_attack_ids(self, df: pd.DataFrame) -> np.ndarray:
+        """Extract per-sample attack IDs (0 = normal)."""
+        return df["attack_id"].values.astype(int)
