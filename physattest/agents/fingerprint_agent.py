@@ -17,13 +17,9 @@ Delegates to security.fingerprint.FingerprintDatabase for the math.
 """
 
 import numpy as np
-import sys
-import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "security"))
-from fingerprint import FingerprintDatabase, FingerprintVerdict, NoiseExtractor, FeatureExtractor
-
-from .state import AgentState, DefenseLevel
+from physattest.agents.state import AgentState, DefenseLevel
+from physattest.security.fingerprint import FingerprintDatabase, FingerprintVerdict, NoiseExtractor, FeatureExtractor
 
 
 # Module-level state — persists across cycles

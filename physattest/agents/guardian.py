@@ -10,12 +10,9 @@ compromised, Guardian still enforces physics-based safety.
 """
 
 import numpy as np
-from .state import AgentState
-import sys
-import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "security"))
-from cbf_filter import CBFSafetyFilter, PlantConfig, PlantState
+from physattest.agents.state import AgentState
+from physattest.security.cbf_filter import CBFSafetyFilter, PlantConfig, PlantState
 
 
 # Module-level CBF instance

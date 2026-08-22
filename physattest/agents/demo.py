@@ -8,12 +8,9 @@ Runs multiple cycles simulating:
 4. Coordinated attack → CRITICAL alert + human notification
 """
 
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import numpy as np
-from agents.graph import build_physattest_graph, run_cycle
+
+from physattest.agents.graph import build_physattest_graph, run_cycle
 
 
 def print_cycle(result: dict, label: str = ""):

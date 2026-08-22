@@ -16,13 +16,9 @@ Delegates to security.prober.ActiveProber for the actual math.
 """
 
 import numpy as np
-import sys
-import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "security"))
-from prober import ActiveProber, ProbeConfig, ProbeVerdict
-
-from .state import AgentState, DefenseLevel
+from physattest.agents.state import AgentState, DefenseLevel
+from physattest.security.prober import ActiveProber, ProbeConfig, ProbeVerdict
 
 # Module-level prober instance — persists across cycles
 _prober: ActiveProber | None = None

@@ -1,177 +1,49 @@
-<<<<<<< HEAD
-"""Overseer agent (thin slice): "Coordinator. Monitors all agent health. Escalates defense
-levels... Triggers human notification for critical situations."
-
-Full Overseer scope (defense-level escalation L1->L4, coordinating Prober/Fingerprint/
-Guardian) needs agents Member 3 owns and that don't exist in this repo yet. What's built
-here is the slice that closes the loop on Member 2's components: run Sentinel across every
-sensor for a cycle, work out which attacks are coordinated (needs visibility across all
-sensors at once, which is exactly what a single Sentinel invocation doesn't have), run the
-forensics engine on confirmed attacks, and apply two of Section 10's three human-notification
-triggers:
-
-  1. multiple agents compromised            -- STUB: needs Prober/Fingerprint agent status,
-                                                 which don't exist yet.
-  2. attack targeting critical infrastructure -- IMPLEMENTED: forensics severity == "critical"
-  3. sustained attack > 30 minutes            -- IMPLEMENTED: tracked via PlantMemory across cycles
-
-Each Overseer graph invocation is one cycle (one timestep) across the whole plant. Health
-scores and sustained-attack timers persist across invocations via PlantMemory -- see
-state.py's docstring for why that lives outside LangGraph state rather than in it.
 """
+Agent 0: Overseer -- Coordinator and defense level manager.
 
-from dataclasses import dataclass, field
-from typing import Dict, List
-
-import numpy as np
-from langgraph.graph import END, StateGraph
-
-from physattest.agents.state import OverseerDependencies, OverseerState
-from physattest.ai.classifier_3way import RESPONSE_ACTIONS
-from physattest.ai.forensics_llm import ForensicsEvidence, ForensicsReport, run_forensics
-
-
-def make_sentinel_pass_node(deps: OverseerDependencies):
-    def run_sentinel_pass(state: OverseerState) -> dict:
-        sensor_windows = state["sensor_windows"]
-        coupling_neighbours = state.get("coupling_neighbours", {})
-        memory = deps.memory
-
-        sensor_results = {}
-        for sensor_id, window in sensor_windows.items():
-            neighbour_ids = coupling_neighbours.get(sensor_id, [])
-            neighbour_windows = {nb: sensor_windows[nb] for nb in neighbour_ids if nb in sensor_windows}
-
-            sentinel_input = {
-                "sensor_id": sensor_id,
-                "residual_window": window,
-                "neighbour_windows": neighbour_windows,
-                "health_score": memory.health_scores.get(sensor_id, 100.0),
-                "health_history": memory.health_history[sensor_id][-10:],
-            }
-            result = deps.sentinel_graph.invoke(sentinel_input)
-            sensor_results[sensor_id] = result
-
-            memory.health_scores[sensor_id] = result["new_health_score"]
-            memory.health_history[sensor_id].append(result["new_health_score"])
-
-        attacked = [
-            sid for sid, r in sensor_results.items() if r["response_action"] == RESPONSE_ACTIONS["attack"]
-        ]
-        return {"sensor_results": sensor_results, "attacked_sensors": attacked}
-
-    return run_sentinel_pass
-
-
-def make_forensics_pass_node(deps: OverseerDependencies):
-    def run_forensics_pass(state: OverseerState) -> dict:
-        attacked = state["attacked_sensors"]
-        sensor_windows = state["sensor_windows"]
-        sensor_results = state["sensor_results"]
-        cycle_index = state.get("cycle_index", 0)
-        memory = deps.memory
-
-        reports: Dict[str, ForensicsReport] = {}
-        for sensor_id in attacked:
-            evidence = ForensicsEvidence(
-                sensor_id=sensor_id,
-                residual_series=np.asarray(sensor_windows[sensor_id], dtype=float),
-                event_context={},  # STUB: Member 1's healing/reconstruction supplies the "true value" detail
-                concurrently_attacked_sensors=attacked,
-                classifier_confidence=sensor_results[sensor_id]["classification"].probabilities["attack"],
-            )
-            reports[sensor_id] = run_forensics(evidence, deps.causal_graph, chain=deps.forensics_chain)
-            memory.attack_since_cycle.setdefault(sensor_id, cycle_index)
-            memory.last_attacked_cycle[sensor_id] = cycle_index
-
-        # Clear sustained-attack timers only after a grace period of consecutive non-attack
-        # cycles, not on the very next miss. The 3-way classifier can flicker near its
-        # decision boundary cycle to cycle (e.g. onset_abruptness computed fresh each cycle
-        # can land just under a threshold even mid-attack) -- resetting the sustained-attack
-        # clock on a single borderline cycle would make Section 10's "sustained attack"
-        # notification effectively unreachable for anything but a perfectly uniform attack
-        # signal, which real sensor noise never produces.
-        for sensor_id in list(memory.attack_since_cycle):
-            if sensor_id in attacked:
-                continue
-            last_seen = memory.last_attacked_cycle.get(sensor_id, -10**9)
-            if cycle_index - last_seen > deps.sustained_attack_grace_cycles:
-                del memory.attack_since_cycle[sensor_id]
-                memory.last_attacked_cycle.pop(sensor_id, None)
-
-        return {"forensics_reports": reports}
-
-    return run_forensics_pass
-
-
-def make_escalate_node(deps: OverseerDependencies):
-    def escalate_and_notify(state: OverseerState) -> dict:
-        cycle_index = state.get("cycle_index", 0)
-        memory = deps.memory
-        notifications: List[str] = []
-
-        for sensor_id, report in state.get("forensics_reports", {}).items():
-            if report.severity == "critical":
-                notifications.append(
-                    f"HUMAN NOTIFICATION: attack on '{sensor_id}' targets critical infrastructure "
-                    f"(forensics severity=critical, response={report.recommended_response})."
-                )
-
-        for sensor_id, since in memory.attack_since_cycle.items():
-            duration = cycle_index - since
-            if duration >= deps.sustained_attack_cycle_threshold:
-                notifications.append(
-                    f"HUMAN NOTIFICATION: sustained attack on '{sensor_id}' for {duration} cycles "
-                    f"(>= {deps.sustained_attack_cycle_threshold}-cycle threshold), system remains safe but degraded."
-                )
-
-        # Section 10 trigger 1 ("multiple agents compromised") is intentionally not evaluated
-        # here -- it needs Prober/Fingerprint agent health status, which don't exist in this
-        # repo yet. Wire it in here once Member 3's agents report their own compromise state.
-
-        return {"notifications": notifications}
-
-    return escalate_and_notify
-
-
-def build_overseer_graph(deps: OverseerDependencies):
-    graph = StateGraph(OverseerState)
-    graph.add_node("run_sentinel_pass", make_sentinel_pass_node(deps))
-    graph.add_node("run_forensics_pass", make_forensics_pass_node(deps))
-    graph.add_node("escalate_and_notify", make_escalate_node(deps))
-
-    graph.set_entry_point("run_sentinel_pass")
-    graph.add_edge("run_sentinel_pass", "run_forensics_pass")
-    graph.add_edge("run_forensics_pass", "escalate_and_notify")
-    graph.add_edge("escalate_and_notify", END)
-    return graph.compile()
-=======
-"""
-Agent 0: Overseer — Coordinator and defense level manager.
-
-Monitors all agent health. Escalates defense levels (L1→L2→L3→L4).
+Monitors all agent health. Escalates defense levels (L1->L2->L3->L4).
 Randomises verification methods each cycle to prevent attacker prediction.
 Triggers human notification for critical situations.
 
-Does NOT make detection decisions — only coordinates based on
+Does NOT make detection decisions -- only coordinates based on
 mathematical evidence from other agents.
+
+This is Member 3's original overseer_pre_node/overseer_post_node, kept as the canonical
+version during merge resolution (it's what agents/graph.py actually wires in, and it already
+covers 2 of Section 10's 3 human-notification triggers using REAL agent_health from
+Guardian/Prober/Fingerprint -- something Member 2's alternate Overseer design could only stub
+out, since it was built before those agents existed). One addition: sustained-attack
+tracking (Section 10 trigger 3, "attack lasting >30 minutes"), which neither original version
+of this file fully implemented against real per-cycle classification data -- added to
+overseer_post_node below, using a grace-period design (tolerate brief classification flicker
+near a decision boundary rather than resetting the timer on a single missed cycle) validated
+during the 3-way classifier's own integration testing.
 """
 
-import numpy as np
 import secrets
-from .state import AgentState, DefenseLevel, AlertSeverity
+from typing import Dict, List
 
+from physattest.agents.state import AgentState, AlertSeverity, DefenseLevel
 
 # Track agent heartbeats across cycles
-_agent_heartbeats: dict[str, int] = {
+_agent_heartbeats: Dict[str, int] = {
     "sentinel": 0,
     "prober": 0,
     "fingerprint": 0,
     "guardian": 0,
 }
-_missed_heartbeats: dict[str, int] = {k: 0 for k in _agent_heartbeats}
+_missed_heartbeats: Dict[str, int] = {k: 0 for k in _agent_heartbeats}
 
 HEARTBEAT_TIMEOUT = 5  # cycles before declaring agent dead
+
+# Sustained-attack tracking (Section 10 trigger 3): per-sensor cycle a sensor was first seen
+# classified "attack", and the cycle it was last seen that way. Kept as module-level state,
+# mirroring _agent_heartbeats above, rather than threaded through AgentState -- it's derived
+# bookkeeping the Overseer needs across cycles, not something any other agent reads.
+_attack_since_cycle: Dict[int, int] = {}
+_last_attacked_cycle: Dict[int, int] = {}
+SUSTAINED_ATTACK_CYCLE_THRESHOLD = 30  # Section 10 rule 3: sustained attack > 30 minutes
+SUSTAINED_ATTACK_GRACE_CYCLES = 2  # tolerate this many consecutive misses before resetting
 
 
 def overseer_pre_node(state: AgentState) -> dict:
@@ -189,16 +61,16 @@ def overseer_pre_node(state: AgentState) -> dict:
     msgs = state.get("messages", [])
 
     # --- Defense level escalation ---
-    # L1: default — observer + transformer + classifier (Sentinel)
-    # L2: weak coupling detected or sustained suspicious → activate Prober
-    # L3: zero coupling or Prober inconclusive → activate Fingerprint
-    # L4: everything degraded → CBF-only mode (Guardian alone)
+    # L1: default -- observer + transformer + classifier (Sentinel)
+    # L2: weak coupling detected or sustained suspicious -> activate Prober
+    # L3: zero coupling or Prober inconclusive -> activate Fingerprint
+    # L4: everything degraded -> CBF-only mode (Guardian alone)
 
     current_level = state.get("defense_level", DefenseLevel.L1_MULTI_DOMAIN)
 
     if severity >= AlertSeverity.CRITICAL:
         new_level = DefenseLevel.L4_CBF_BOUNDING
-        reason = "CRITICAL alert — CBF bounding mode"
+        reason = "CRITICAL alert -- CBF bounding mode"
     elif severity >= AlertSeverity.HIGH or len(blocked) >= 2:
         new_level = max(current_level, DefenseLevel.L3_FINGERPRINTING)
         reason = f"HIGH alert or {len(blocked)} blocked sensors"
@@ -209,13 +81,13 @@ def overseer_pre_node(state: AgentState) -> dict:
         # Gradual de-escalation after 30 clean cycles
         if cycle % 30 == 0 and severity == AlertSeverity.NONE and current_level > 1:
             new_level = current_level - 1
-            reason = "30 clean cycles — de-escalating"
+            reason = "30 clean cycles -- de-escalating"
         else:
             new_level = current_level
             reason = ""
 
     if new_level != current_level and reason:
-        msgs = msgs + [f"[Overseer] Defense level L{current_level}→L{new_level}: {reason}"]
+        msgs = msgs + [f"[Overseer] Defense level L{current_level}->L{new_level}: {reason}"]
 
     # --- Agent health check ---
     agent_health = state.get("agent_health", {k: True for k in _agent_heartbeats})
@@ -224,7 +96,7 @@ def overseer_pre_node(state: AgentState) -> dict:
     healthy_count = sum(1 for v in agent_health.values() if v)
     compromised_count = 4 - healthy_count
 
-    # --- Human notification (Theorem 6: safe with ≤2 compromised) ---
+    # --- Human notification (Theorem 6: safe with <=2 compromised) ---
     human_notified = state.get("human_notified", False)
     if compromised_count >= 3 and not human_notified:
         msgs = msgs + [
@@ -240,8 +112,11 @@ def overseer_pre_node(state: AgentState) -> dict:
         human_notified = True
 
     # --- Randomise verification order ---
-    # Prevents attacker from predicting which checks run when
-    verification_seed = secrets.token_hex(8)
+    # Prevents attacker from predicting which checks run when. Not yet consumed by any
+    # downstream agent -- the "randomise verification methods" feature described in this
+    # module's docstring is declared here but not wired further; left as-is rather than
+    # silently dropped, since fixing that is a Member 3 design question, not a merge issue.
+    verification_seed = secrets.token_hex(8)  # noqa: F841
 
     return {
         "defense_level": int(new_level),
@@ -253,6 +128,42 @@ def overseer_pre_node(state: AgentState) -> dict:
     }
 
 
+def _update_sustained_attack_tracking(state: AgentState, cycle: int) -> List[str]:
+    """Section 10 trigger 3: notify if any sensor has been classified "attack" for at least
+    SUSTAINED_ATTACK_CYCLE_THRESHOLD cycles, tolerating brief classification flicker.
+
+    Uses state["classification"] (written by sentinel_node this cycle) rather than
+    blocked_sensors/alert_severity -- "classified attack" is a more precise signal than
+    "blocked" (a sensor can be blocked and later classified fault or anomaly) or "severity"
+    (a plant-wide aggregate, not per-sensor).
+    """
+    classification = state.get("classification", {})
+    attacked_now = [sid for sid, c in classification.items() if c == "attack"]
+
+    for sid in attacked_now:
+        _attack_since_cycle.setdefault(sid, cycle)
+        _last_attacked_cycle[sid] = cycle
+
+    for sid in list(_attack_since_cycle):
+        if sid in attacked_now:
+            continue
+        last_seen = _last_attacked_cycle.get(sid, -10**9)
+        if cycle - last_seen > SUSTAINED_ATTACK_GRACE_CYCLES:
+            del _attack_since_cycle[sid]
+            _last_attacked_cycle.pop(sid, None)
+
+    notifications = []
+    for sid, since in _attack_since_cycle.items():
+        duration = cycle - since
+        if duration >= SUSTAINED_ATTACK_CYCLE_THRESHOLD:
+            notifications.append(
+                f"[Overseer] HUMAN NOTIFICATION: sustained attack on sensor {sid} for "
+                f"{duration} cycles (>= {SUSTAINED_ATTACK_CYCLE_THRESHOLD}-cycle threshold), "
+                "system remains safe but degraded."
+            )
+    return notifications
+
+
 def overseer_post_node(state: AgentState) -> dict:
     """
     Overseer POST-step: runs AFTER other agents each cycle.
@@ -260,7 +171,8 @@ def overseer_post_node(state: AgentState) -> dict:
     1. Collect results from all agents
     2. Update agent health based on who reported
     3. Escalate defense level based on THIS cycle's results
-    4. Log cycle summary
+    4. Check sustained-attack duration (Section 10 trigger 3)
+    5. Log cycle summary
     """
     msgs = state.get("messages", [])
     cycle = state.get("cycle_count", 0)
@@ -286,7 +198,7 @@ def overseer_post_node(state: AgentState) -> dict:
     # --- Escalate based on this cycle's findings ---
     if severity >= AlertSeverity.CRITICAL:
         new_level = DefenseLevel.L4_CBF_BOUNDING
-        reason = "CRITICAL alert — CBF bounding mode"
+        reason = "CRITICAL alert -- CBF bounding mode"
     elif severity >= AlertSeverity.HIGH or len(blocked) >= 2:
         new_level = max(current_level, DefenseLevel.L3_FINGERPRINTING)
         reason = f"HIGH alert or {len(blocked)} blocked sensors"
@@ -296,27 +208,30 @@ def overseer_post_node(state: AgentState) -> dict:
     else:
         if cycle % 30 == 0 and severity == AlertSeverity.NONE and current_level > 1:
             new_level = current_level - 1
-            reason = "30 clean cycles — de-escalating"
+            reason = "30 clean cycles -- de-escalating"
         else:
             new_level = current_level
             reason = ""
 
     if new_level != current_level and reason:
-        msgs = msgs + [f"[Overseer] Defense level L{current_level}→L{new_level}: {reason}"]
+        msgs = msgs + [f"[Overseer] Defense level L{current_level}->L{new_level}: {reason}"]
 
     # --- Human notification ---
     human_notified = state.get("human_notified", False)
     healthy_count = sum(1 for v in agent_health.values() if v)
     if (4 - healthy_count) >= 3 and not human_notified:
-        msgs = msgs + [
-            "[Overseer] HUMAN NOTIFICATION: 3+ agents may be compromised."
-        ]
+        msgs = msgs + ["[Overseer] HUMAN NOTIFICATION: 3+ agents may be compromised."]
         human_notified = True
     elif severity >= AlertSeverity.CRITICAL and not human_notified:
         msgs = msgs + [
             "[Overseer] HUMAN NOTIFICATION: Critical attack detected. "
             "System is safe (CBF active) but human should be aware."
         ]
+        human_notified = True
+
+    sustained_notifications = _update_sustained_attack_tracking(state, cycle)
+    if sustained_notifications:
+        msgs = msgs + sustained_notifications
         human_notified = True
 
     # Cycle summary
@@ -335,4 +250,3 @@ def overseer_post_node(state: AgentState) -> dict:
         "human_notified": human_notified,
         "messages": msgs,
     }
->>>>>>> 67782d2bf638fc6e1aa240b226b523957b981a18
