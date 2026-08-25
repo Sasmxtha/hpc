@@ -14,7 +14,7 @@ Usage:
 
 import numpy as np
 from scipy.linalg import solve_discrete_are, expm
-from typing import Dict, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .physics_equations import (
     mass_conservation_tank, flow_conservation_junction,
@@ -27,6 +27,7 @@ from .math_invariants import (
     volume_level_consistency, flow_balance_across_stages,
     total_water_mass_conservation
 )
+from .sindy_discovery import discover_equations, refine_observer_matrices
 
 
 # -----------------------------------------------------------------------
@@ -42,6 +43,8 @@ STATE_DP3  = 6   # Differential pressure across UF membrane
 
 N_STATES = 7
 
+STATE_NAMES = ["h1", "h3", "h4", "pH", "ORP", "cond", "dP3"]  # positional, matches STATE_* order
+
 # -----------------------------------------------------------------------
 # Input indices (positions in the input vector u)
 # -----------------------------------------------------------------------
@@ -55,6 +58,10 @@ INPUT_P601  = 6   # Backwash pump (0/1)
 INPUT_UV401 = 7   # UV lamp (0/1)
 
 N_INPUTS = 8
+
+INPUT_NAMES = [  # positional, matches INPUT_* order -- used as SINDy feature_names
+    "MV101", "P101", "P201", "P301", "P302", "P501", "P601", "UV401"
+]
 
 # -----------------------------------------------------------------------
 # Sensor-to-state mapping
@@ -127,6 +134,21 @@ class MultiDomainObserver:
 
         # History for SINDy (stores recent residuals)
         self.residual_history = []
+
+        # Raw (y, u) trajectory history, bounded, for SINDy Layer 2 refinement --
+        # residual_history alone isn't enough to run SINDy on, since SINDy needs the actual
+        # state/control trajectory (what SINDy fits equations TO), not the gap between
+        # measurement and the current model's prediction.
+        self.y_history: List[np.ndarray] = []
+        self.u_history: List[np.ndarray] = []
+        self._history_cap = 3000
+
+        # Layer 3 PINN fallbacks, registered per state index via set_pinn_fallback(). Only
+        # states where Layer 1 (handwritten) + Layer 2 (SINDy) are known to be a poor fit
+        # for genuinely nonlinear dynamics should get one -- see set_pinn_fallback's
+        # docstring. Empty until explicitly registered; step() falls back to the Layer 1/2
+        # linear prediction for any state with no PINN registered.
+        self._pinn_fallbacks: Dict[int, dict] = {}
 
     def _build_continuous_system(self) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -242,8 +264,21 @@ class MultiDomainObserver:
                 'combined':  combined residual vector
                 'x_hat':     current state estimate
         """
-        # --- Step 1: Predict ---
+        # --- Step 1: Predict (Layer 1/2: handwritten + SINDy-refined linear model) ---
         x_pred = self.A_d @ self.x_hat + self.B_d @ u
+
+        # --- Step 1b: Layer 3 PINN fallback, for any state where one is registered ---
+        # Overrides the linear prediction for that state only; every other state keeps its
+        # Layer 1/2 prediction untouched. See set_pinn_fallback() for when this is warranted.
+        for state_idx, fallback in self._pinn_fallbacks.items():
+            x_pred[state_idx] = fallback["predict"](self.x_hat, u, self.dt)
+
+        # --- Track raw (y, u) trajectory for SINDy Layer 2 refinement ---
+        self.y_history.append(y.copy())
+        self.u_history.append(u.copy())
+        if len(self.y_history) > self._history_cap:
+            self.y_history = self.y_history[-self._history_cap:]
+            self.u_history = self.u_history[-self._history_cap:]
 
         # --- Step 2: Compute domain-specific residuals ---
         r_physics = self._compute_physics_residuals(y, x_pred, u)
@@ -361,6 +396,100 @@ class MultiDomainObserver:
     def trust_sensor(self, state_idx: int):
         """Restore trust in a sensor."""
         self.trust_mask[state_idx] = 1.0
+
+    def refine_with_sindy(
+        self, min_samples: int = 300, threshold: float = 1e-5, blend_factor: float = 0.3
+    ) -> Optional[Dict]:
+        """
+        Layer 2: refine the Layer 1 handwritten A/B matrices using SINDy-discovered
+        coefficients from the actual (y, u) trajectory this observer has seen.
+
+        Returns None (and does nothing) if fewer than min_samples of history have
+        accumulated yet -- SINDy needs a reasonably long, control-input-excited trajectory
+        to identify coefficients reliably, matching the persistent-excitation requirement
+        documented in sindy_discovery.py's own synthetic-data generator. Call this
+        periodically (e.g. every few hundred steps) once the plant has been running long
+        enough, not on every step -- refitting SINDy every cycle would be wasteful and would
+        make A_d/B_d (and therefore the Kalman gain) jitter step to step.
+
+        threshold defaults small (1e-5), not PySINDy's usual 0.01-0.05: this observer's
+        states are in physical units (metres, pH, mV, uS/cm) driven by pump flow rates in
+        m^3/s divided by tank areas in m^2, so genuine coefficients here are routinely
+        ~1e-4-1e-3 in magnitude. A default sparsity threshold sized for the spec's own
+        thermal example (coefficients ~0.02-0.04) silently zeroes out every real coefficient
+        for a state like h1 -- confirmed directly: threshold=0.01 eliminated ALL of h1's
+        terms and left the "refined" model bitwise identical to Layer 1 alone.
+
+        After a successful refinement, A_d/B_d are re-discretized and the Kalman gain is
+        recomputed, since both are functions of A_c/A_d which just changed.
+        """
+        if len(self.y_history) < min_samples:
+            return None
+
+        state_data = np.array(self.y_history)
+        input_data = np.array(self.u_history)
+        feature_names = STATE_NAMES + INPUT_NAMES
+
+        result = discover_equations(
+            state_data=state_data,
+            input_data=input_data,
+            dt=self.dt,
+            feature_names=feature_names,
+            threshold=threshold,
+            max_poly_degree=1,  # match Layer 1's linear structure -- SINDy refines
+            # coefficients of the SAME linear terms Layer 1 already has, not new nonlinear
+            # ones (that is Layer 3 / PINN's job, per the spec's own layering).
+        )
+
+        self.A_c, self.B_c = refine_observer_matrices(result, self.A_c, self.B_c, blend_factor)
+        self.A_d, self.B_d = self._discretize(self.A_c, self.B_c, self.dt)
+        self.L = self._compute_kalman_gain()
+
+        return result
+
+    def set_pinn_fallback(self, state_idx: int, pinn_model, u_index: Optional[int], predict_fn) -> None:
+        """
+        Layer 3: register a PINN as the prediction source for one state, replacing the
+        Layer 1/2 linear prediction for that state only.
+
+        Only warranted for a state whose true dynamics are genuinely nonlinear in a way
+        neither Layer 1 (hand-derived linear coefficients) nor Layer 2 (SINDy, which this
+        observer also restricts to degree-1/linear terms, matching Layer 1's structure) can
+        represent -- per the spec, PINN is for "relationships too complex for SINDy," not a
+        blanket replacement. In this plant, that's STATE_DP3 (membrane fouling): fouling
+        accumulates roughly with flow-RATE-SQUARED, not flow-linear, which a linear A/B
+        matrix structurally cannot express regardless of how its coefficients are fitted.
+        See physattest/observer/pinn.py's membrane_fouling_residual/PINN_DP3 for the trained
+        model and the validation showing it actually helps (physattest/observer/pinn.py's
+        __main__, dp3_fouling section).
+
+        predict_fn(x_hat, u, dt) -> float is the caller-supplied glue between this
+        observer's state representation and the PINN's own (t, control) input convention --
+        kept as an explicit callback rather than hardcoding the PINN's calling convention
+        here, since different states may need different PINNs with different control inputs.
+        """
+        self._pinn_fallbacks[state_idx] = {
+            "model": pinn_model,
+            "u_index": u_index,
+            "predict": predict_fn,
+        }
+
+    def clear_pinn_fallback(self, state_idx: int) -> None:
+        self._pinn_fallbacks.pop(state_idx, None)
+
+    def enable_dp3_pinn_fallback(self, pinn_model=None) -> None:
+        """Registers the membrane-fouling PINN as STATE_DP3's Layer 3 fallback (see
+        set_pinn_fallback's docstring for why DP3 specifically). Trains a fresh model
+        (physattest.observer.pinn.train_dp3_pinn, a few thousand epochs) if pinn_model isn't
+        supplied -- pass an already-trained model (e.g. loaded from a persisted checkpoint)
+        to avoid re-training on every call.
+        """
+        from .pinn import make_dp3_predict_fn, train_dp3_pinn
+
+        if pinn_model is None:
+            pinn_model = train_dp3_pinn()
+        predict_fn = make_dp3_predict_fn(pinn_model, u_uf_idx=INPUT_P301, u_bw_idx=INPUT_P601)
+        self.set_pinn_fallback(STATE_DP3, pinn_model, u_index=None, predict_fn=predict_fn)
 
     def get_residual_magnitudes(self) -> Optional[Dict[str, float]]:
         """Return the magnitude of the latest residuals for each domain."""

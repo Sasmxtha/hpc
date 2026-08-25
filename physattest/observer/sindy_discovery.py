@@ -137,20 +137,41 @@ def refine_observer_matrices(
     blend_factor: how much weight to give SINDy vs handwritten (0 = all
     handwritten, 1 = all SINDy). Start low (0.3) and increase as SINDy
     proves accurate.
+
+    B_current IS refined here -- an earlier version of this function only ever touched A and
+    returned B unchanged regardless of blend_factor, silently a no-op for exactly the kind of
+    plant mismatch this function exists to correct whenever it lives entirely in a
+    control-input coefficient (e.g. a pump's true flow rate differing from its hand-coded
+    estimate, which in this observer's A/B structure is a B-matrix term, not an A-matrix
+    one). Confirmed via a live test: refining only A left prediction error on a plant with a
+    mis-estimated pump flow rate completely unchanged (0.0% improvement) because that
+    particular mismatch has no A-matrix component to correct at all.
     """
     coeffs = sindy_result["coefficients"]
     n_states = A_current.shape[0]
+    n_inputs = B_current.shape[1]
 
-    # SINDy's coefficient matrix includes bias and polynomial terms.
-    # The linear terms (columns 1:n_states+1) map to the A matrix.
-    if coeffs.shape[1] > n_states:
+    # SINDy's coefficient matrix is [bias | state columns | control/input columns], built
+    # from feature_names = state_names + input_names via discover_equations's polynomial
+    # library (degree=1, include_bias=True). Column 0 is the bias term (not used here --
+    # A/B are linear operators, no constant offset); columns 1:n_states+1 are the state
+    # (A-matrix) terms; the remaining n_inputs columns are the control (B-matrix) terms.
+    if coeffs.shape[1] >= 1 + n_states + n_inputs:
         A_sindy = coeffs[:n_states, 1:n_states + 1]
+        B_sindy = coeffs[:n_states, n_states + 1:n_states + 1 + n_inputs]
+    elif coeffs.shape[1] > n_states:
+        # No control columns were included in this fit (input_data was None) -- refine A
+        # only, leave B untouched, matching the previous behaviour for that case.
+        A_sindy = coeffs[:n_states, 1:n_states + 1]
+        B_sindy = None
     else:
         A_sindy = coeffs[:n_states, :n_states]
+        B_sindy = None
 
     A_refined = (1 - blend_factor) * A_current + blend_factor * A_sindy
+    B_refined = (1 - blend_factor) * B_current + blend_factor * B_sindy if B_sindy is not None else B_current
 
-    return A_refined, B_current
+    return A_refined, B_refined
 
 
 def validate_against_conservation(

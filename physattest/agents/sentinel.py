@@ -13,13 +13,18 @@ its own integration testing. Confirmed attacks are handed to
 physattest.ai.forensics_llm.run_forensics for causal-chain narrative and severity/response
 assessment, instead of security.llm_fallback's simpler canned-text forensics.
 
-physattest.ml.anomaly_transformer (Component 6) is deliberately NOT wired in here yet. It
-needs a checkpoint trained on real residual data to be a net positive detection signal --
-wiring in a freshly-initialized model would inject near-random noise into classification,
-which is exactly the failure mode a from-scratch-vs-transfer-learning comparison during this
-project surfaced elsewhere (an undertrained model produced worse-than-baseline results).
-Once a trained checkpoint exists, its window-level score is a natural extra term to fold into
-_build_ml_evidence's residual_magnitude/onset_abruptness alongside the existing z-score.
+physattest.ml.anomaly_transformer (Component 6) IS now wired in, using a checkpoint trained
+on residuals from the real, SINDy+PINN-integrated MultiDomainObserver (see
+physattest/ml/train_transformer_checkpoint.py), not the freshly-initialized model an earlier
+version of this module deliberately avoided wiring in (an undertrained model injects
+near-random noise into detection, which is exactly the failure mode a from-scratch-vs-
+transfer-learning comparison elsewhere in this project ran into before it was fixed -- the
+lesson generalizes here too, so the checkpoint gates whether this signal is used at all: see
+_get_transformer()). Its role is specifically the one the spec gives it: catching sustained
+drift too subtle for the per-step z-score threshold to ever fire on -- a sensor with a low
+z-score every single cycle can still be flagged "suspicious" if its recent residual WINDOW
+has a shape the transformer recognises as anomalous. It does not override BLOCK_THRESH's
+physics-based blocking, only adds a softer trigger for what would otherwise be "clean".
 
 Import note: this file previously used `sys.path.insert(...)` plus bare imports
 (`from agents.state import AgentState`, `from security.llm_fallback import ...`). That is
@@ -32,19 +37,27 @@ IntEnum compares by underlying value, but it's fragile. Fixed here to use absolu
 `physattest.`-prefixed imports throughout, matching graph.py's convention.
 """
 
+import os
 from typing import Dict, List, Optional
 
 import networkx as nx
 import numpy as np
+import torch
 
 from physattest.agents.state import AgentState, AlertSeverity
 from physattest.ai.classifier_3way import SensorEvidence as MLSensorEvidence
 from physattest.ai.classifier_3way import classify as ml_classify
 from physattest.ai.forensics_llm import ForensicsEvidence, add_causal_link, run_forensics
 from physattest.ai.llm_fallback import FallbackChain, GroqBackend, TinyLlamaBackend
+from physattest.ml.anomaly_transformer import ResidualAnomalyTransformer
 
 BLOCK_THRESH = 5.0
 SUSPICIOUS_THRESH = 2.5
+TRANSFORMER_SCORE_THRESH = 0.5
+TRANSFORMER_SEQ_LEN = 20
+TRANSFORMER_CHECKPOINT_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "ml", "checkpoints", "anomaly_transformer_h1.pt"
+)
 
 # Coupling edges for neighbour votes (subset used by sentinel) -- a fixed 6-sensor
 # abstraction, as used throughout agents/demo.py. physattest/graph/coupling_graph.py's real
@@ -59,11 +72,77 @@ COUPLING_PAIRS = [
 _health_history: Dict[int, List[float]] = {}
 # Per-sensor rolling normalised-residual history, used to derive onset_abruptness -- how
 # abruptly THIS cycle's deviation appeared relative to the sensor's own recent readings, not
-# just whether it's currently large.
+# just whether it's currently large. Values are abs(residual)/noise_std -- magnitude only.
 _residual_history: Dict[int, List[float]] = {}
+# Per-sensor rolling SIGNED residual history (not abs-valued), for Component 6's transformer
+# -- see _transformer_flags_drift's docstring for why this needs to be a separate buffer
+# from _residual_history rather than reusing it.
+_raw_residual_history: Dict[int, List[float]] = {}
 
 _llm_chain: Optional[FallbackChain] = None
 _causal_graph: Optional[nx.DiGraph] = None
+_transformer: Optional[ResidualAnomalyTransformer] = None
+_transformer_load_attempted = False
+
+
+def _normalize_window(window: np.ndarray) -> np.ndarray:
+    """Z-score a window by its own early-portion baseline. Must match
+    physattest/ml/train_transformer_checkpoint.py's normalize_window exactly -- the
+    checkpoint was trained on windows normalized this way, so scoring with any other
+    convention would silently feed it out-of-distribution input.
+    """
+    edge = max(1, len(window) // 5)
+    baseline_mean = float(np.mean(window[:edge]))
+    baseline_std = float(np.std(window[:edge])) + 1e-6
+    return (window - baseline_mean) / baseline_std
+
+
+def _get_transformer() -> Optional[ResidualAnomalyTransformer]:
+    """Lazily loads the Component 6 checkpoint. Returns None (and only ever tries once) if
+    it isn't there -- a missing checkpoint means "not trained yet," and detection should
+    silently fall back to z-score-only gating, not crash or, worse, run a randomly-
+    initialized model that would inject noise into classification.
+    """
+    global _transformer, _transformer_load_attempted
+    if _transformer is not None or _transformer_load_attempted:
+        return _transformer
+    _transformer_load_attempted = True
+    if not os.path.exists(TRANSFORMER_CHECKPOINT_PATH):
+        return None
+    checkpoint = torch.load(TRANSFORMER_CHECKPOINT_PATH, map_location="cpu", weights_only=False)
+    model = ResidualAnomalyTransformer(n_sensors=1, **checkpoint["config"])
+    model.load_state_dict(checkpoint["state_dict"])
+    model.eval()
+    _transformer = model
+    return _transformer
+
+
+def _transformer_flags_drift(sensor_id: int) -> bool:
+    """True if Component 6 recognises the sensor's recent residual window as anomalous,
+    even though the per-step z-score gate did not fire on it -- the "subtle slow-drift
+    attacks that threshold detection misses" case from the spec. Silently returns False
+    (never flags) if the checkpoint isn't available or there isn't yet a full window of
+    history for this sensor -- this is an additive signal, its absence should never block
+    normal z-score-based detection from working.
+
+    Uses _raw_residual_history (signed), not _residual_history (abs-valued, used for
+    onset_abruptness): the checkpoint was trained on the real observer's signed residual, so
+    a ramp going negative or an oscillation crossing zero has a shape the model was actually
+    shown. Rectifying the sign away first, as _residual_history does, would silently feed
+    the model a distribution it never saw during training.
+    """
+    model = _get_transformer()
+    if model is None:
+        return False
+    history = _raw_residual_history.get(sensor_id, [])
+    if len(history) < TRANSFORMER_SEQ_LEN:
+        return False
+    window = _normalize_window(np.array(history[-TRANSFORMER_SEQ_LEN:], dtype=np.float32))
+    window_t = torch.from_numpy(window).reshape(1, TRANSFORMER_SEQ_LEN, 1)
+    with torch.no_grad():
+        _, window_logit = model(window_t)
+    score = float(torch.sigmoid(window_logit)[0])
+    return score > TRANSFORMER_SCORE_THRESH
 
 
 def _get_llm_chain() -> FallbackChain:
@@ -216,6 +295,9 @@ def sentinel_node(state: AgentState) -> dict:
         _residual_history.setdefault(i, []).append(float(normalised[i]))
         if len(_residual_history[i]) > 20:
             _residual_history[i] = _residual_history[i][-20:]
+        _raw_residual_history.setdefault(i, []).append(float(residuals[i]))
+        if len(_raw_residual_history[i]) > TRANSFORMER_SEQ_LEN:
+            _raw_residual_history[i] = _raw_residual_history[i][-TRANSFORMER_SEQ_LEN:]
 
         if normalised[i] > BLOCK_THRESH:
             statuses.append("blocked")
@@ -243,6 +325,21 @@ def sentinel_node(state: AgentState) -> dict:
                 result = ml_classify(evidence, chain=chain)
                 classifications[i] = max(result.probabilities, key=result.probabilities.get)
                 last_backend_used = result.backend_used
+        elif _transformer_flags_drift(i):
+            # Below the z-score threshold every single cycle, but Component 6 recognises
+            # the recent window's SHAPE as anomalous -- the slow-drift case the spec
+            # specifically calls out threshold detection as missing. Deliberately routed to
+            # "suspicious", not "blocked": this is a softer, pattern-based signal, not the
+            # physics-based BLOCK_THRESH violation that justifies freezing the sensor's
+            # verified value outright.
+            statuses.append("suspicious")
+            suspicious.append(i)
+            health_scores[i] = max(0, health_scores[i] - 1)
+
+            evidence = _build_ml_evidence(i, n_sensors, normalised, health_scores, command, fp_status)
+            result = ml_classify(evidence, chain=chain)
+            classifications[i] = max(result.probabilities, key=result.probabilities.get)
+            last_backend_used = result.backend_used
         else:
             statuses.append("clean")
             health_scores[i] = min(100, health_scores[i] + 0.5)
