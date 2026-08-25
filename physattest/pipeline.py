@@ -158,6 +158,7 @@ class PhysAttestPipeline:
         # Collect residuals on normal data (skip warmup)
         residuals = {"physics": [], "chemistry": [], "math": [], "combined": []}
         per_state_residuals = []
+        per_state_signed = []
         n_rows = len(df)
         for i in range(1, n_rows):
             y = self._extract_state(df.iloc[i], sensor_names)
@@ -168,6 +169,7 @@ class PhysAttestPipeline:
                 for domain in residuals:
                     residuals[domain].append(np.linalg.norm(result[domain]))
                 per_state_residuals.append(np.abs(result["combined"]))
+                per_state_signed.append(result["combined"].copy())
 
         # Set domain-level thresholds (on norm)
         for domain in self.thresholds:
@@ -176,21 +178,27 @@ class PhysAttestPipeline:
             std = np.std(vals)
             self.thresholds[domain] = mean + self.threshold_sigma * std
 
-        # Set per-state thresholds (on individual components)
-        # This is more robust: a consistently large chemistry residual
-        # is "normal" — only CHANGES from the baseline trigger detection
+        # Set per-state thresholds (on individual absolute residual components)
         per_state_residuals = np.array(per_state_residuals)  # (n_samples, N_STATES)
         self.state_means = np.mean(per_state_residuals, axis=0)
         self.state_stds = np.std(per_state_residuals, axis=0)
-        self.state_stds = np.maximum(self.state_stds, 1e-6)  # avoid division by zero
+        self.state_stds = np.maximum(self.state_stds, 1e-6)
         self.state_thresholds = self.state_means + self.threshold_sigma * self.state_stds
 
+        # Signed residual statistics for the bias detector.
+        # Under normal operation, signed residuals may have nonzero mean
+        # (model bias). The bias detector flags when the window mean
+        # shifts AWAY from this baseline.
+        self.signed_means = np.mean(per_state_signed, axis=0)
+        self.signed_stds = np.std(per_state_signed, axis=0)
+        self.signed_stds = np.maximum(self.signed_stds, 1e-6)
+
         print(f"  Calibrated on {n_rows - warmup} samples (after {warmup}s warmup).")
-        print(f"  Domain thresholds ({self.threshold_sigma}σ):")
+        print(f"  Domain thresholds ({self.threshold_sigma}sigma):")
         for domain, thresh in self.thresholds.items():
             print(f"    {domain:12s}: {thresh:.6f}")
 
-        state_names = ["h1", "h3", "h4", "pH", "ORP", "cond", "ΔP"]
+        state_names = ["h1", "h3", "h4", "pH", "ORP", "cond", "dP"]
         print(f"  Per-state thresholds:")
 
         # Determine which states have a calibrated model (useful for detection)
@@ -251,14 +259,32 @@ class PhysAttestPipeline:
 
         # Run detection after warmup
         detections: List[DetectionResult] = []
-        ALERT_SIGMA = 4.0      # per-state z-score threshold
 
-        # Detection is purely instantaneous z-score based.
-        # No Kalman gain zeroing here — that feedback loop requires
-        # the 3-way classifier (Component 6, Member 2) to distinguish
-        # genuine attacks from noise before committing to a flag.
-        # Without the classifier, flagging cascades through the
-        # coupled Kalman gain and creates runaway false positives.
+        # Three-layer detector (Shewhart + CUSUM + Bias).
+        #
+        # Layer 1 - Shewhart: instant alert for large spikes (z > 5sigma).
+        # Layer 2 - CUSUM: accumulates small persistent deviations.
+        # Layer 3 - Bias: sliding window mean of SIGNED residuals.
+        #   Even when Kalman absorbs most of an attack, the residual
+        #   stays consistently biased in one direction. Under normal
+        #   operation, the signed mean over a window is ~0.
+        INSTANT_SIGMA = 5.0
+        CUSUM_DRIFT = 0.5
+        CUSUM_BOUNDARY = 8.0
+        CUSUM_DECAY = 0.99
+        BIAS_WINDOW = 60            # seconds of signed residual to average
+        BIAS_SIGMA = 3.5            # signed mean exceeds this many sigma
+
+        cusum_pos = np.zeros(N_STATES)
+        cusum_neg = np.zeros(N_STATES)
+        # Ring buffer for signed residuals (for bias detection)
+        signed_buffer = np.zeros((BIAS_WINDOW, N_STATES))
+        buf_idx = 0
+        buf_filled = False
+
+        # Bias threshold: std of the window-mean of signed residuals.
+        # For i.i.d. noise with std=s, mean over N samples has std = s/sqrt(N).
+        bias_std = self.signed_stds / np.sqrt(BIAS_WINDOW)
 
         for i in range(max(1, warmup), n_rows):
             row = df.iloc[i]
@@ -272,22 +298,50 @@ class PhysAttestPipeline:
             r_math = np.linalg.norm(result["math"])
             r_comb = np.linalg.norm(result["combined"])
 
-            # Per-state z-score: flag if any calibrated state deviates
-            abs_residual = np.abs(result["combined"])
+            # Signed residual (keeps direction information)
+            signed_residual = result["combined"]
+            abs_residual = np.abs(signed_residual)
             z_scores = (abs_residual - self.state_means) / self.state_stds
 
-            is_detected = any(
-                z_scores[s] > ALERT_SIGMA
+            # Update CUSUM
+            for s in range(N_STATES):
+                if not self.active_detection_states[s]:
+                    continue
+                cusum_pos[s] = max(0, cusum_pos[s] * CUSUM_DECAY + z_scores[s] - CUSUM_DRIFT)
+                cusum_neg[s] = max(0, cusum_neg[s] * CUSUM_DECAY - z_scores[s] - CUSUM_DRIFT)
+
+            # Update bias ring buffer
+            signed_buffer[buf_idx] = signed_residual
+            buf_idx = (buf_idx + 1) % BIAS_WINDOW
+            if buf_idx == 0:
+                buf_filled = True
+
+            # Layer 1: Shewhart
+            instant_alert = any(
+                z_scores[s] > INSTANT_SIGMA
                 for s in range(N_STATES)
                 if self.active_detection_states[s]
             )
+            # Layer 2: CUSUM
+            cusum_alert = any(
+                (cusum_pos[s] > CUSUM_BOUNDARY or cusum_neg[s] > CUSUM_BOUNDARY)
+                for s in range(N_STATES)
+                if self.active_detection_states[s]
+            )
+            # Layer 3: Bias (signed window mean shifted from calibrated baseline)
+            bias_alert = False
+            if buf_filled:
+                window_mean = np.mean(signed_buffer, axis=0)
+                bias_z = np.abs(window_mean - self.signed_means) / bias_std
+                bias_alert = any(
+                    bias_z[s] > BIAS_SIGMA
+                    for s in range(N_STATES)
+                    if self.active_detection_states[s]
+                )
+
+            is_detected = instant_alert or cusum_alert or bias_alert
 
             true_label = bool(row.get("is_attack", False))
-
-            healed = []
-            if is_detected:
-                idx_to_sensor = {v: k for k, v in SENSOR_TO_STATE.items()}
-                healed = [idx_to_sensor[s] for s in flagged_states if s in idx_to_sensor]
 
             detections.append(DetectionResult(
                 timestamp=i,
@@ -297,7 +351,6 @@ class PhysAttestPipeline:
                 residual_combined=r_comb,
                 is_detected=is_detected,
                 true_label=true_label,
-                healed_sensors=healed,
             ))
 
         # Compute metrics
