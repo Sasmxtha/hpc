@@ -7,3 +7,8 @@ __pycache__/
 node_modules/
 .env
 
+# SWaT dataset (large files, NDA-protected — do not push)
+data/swat/*.xlsx
+data/swat/*.csv
+data/swat/*.zip
+data/swat/*.pdf

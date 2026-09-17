@@ -702,7 +702,7 @@ def tab_theorem_verification():
     latex = r"""\begin{table}[t]
 \centering
 \caption{Numerical verification of formal theorems. All three core theorems verified with the stated parameters.}
-\label{tab:theorems}
+\label{tab:theorem_verification}
 \begin{tabular}{clcc}
 \toprule
 Theorem & Statement & Verified & Key metric \\

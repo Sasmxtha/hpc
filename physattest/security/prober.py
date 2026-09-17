@@ -88,9 +88,8 @@ class PerturbationDesigner:
 
         # Cryptographic random direction — unpredictable
         raw_bytes = secrets.token_bytes(n * 8)
-        raw = np.frombuffer(raw_bytes, dtype=np.float64)
-        # Map to [-1, 1] range
-        direction = (raw % 2.0) - 1.0
+        raw = np.frombuffer(raw_bytes, dtype=np.uint64)
+        direction = (raw / np.iinfo(np.uint64).max) * 2.0 - 1.0
         direction = direction / (np.linalg.norm(direction) + 1e-10)
 
         # Project onto directions that maximise response at target sensors

@@ -84,13 +84,15 @@ class SWaTLoader:
         # Parse timestamp
         for col in ["Timestamp", "timestamp", "DateTime"]:
             if col in df.columns:
-                df["timestamp"] = pd.to_datetime(df[col])
+                df["timestamp"] = pd.to_datetime(
+                    df[col].str.strip(), dayfirst=True, format="mixed"
+                )
                 break
 
         # Parse attack label
         for col in ["Normal/Attack", "Attack", "Label", "label"]:
             if col in df.columns:
-                df["is_attack"] = df[col].str.strip().str.lower().isin(
+                df["is_attack"] = df[col].str.strip().str.replace(r"\s+", "", regex=True).str.lower().isin(
                     ["attack", "a", "1", "true"]
                 )
                 break

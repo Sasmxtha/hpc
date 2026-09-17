@@ -4,7 +4,9 @@
 
 \documentclass[journal]{IEEEtran}
 
-\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\newtheorem{theorem}{Theorem}
+\newtheorem{corollary}{Corollary}
 \usepackage{algorithmic}
 \usepackage{algorithm}
 \usepackage{graphicx}
@@ -40,7 +42,7 @@
 \maketitle
 
 \begin{abstract}
-Agentic IoT systems that use large language model (LLM) agents for autonomous decision-making introduce attack surfaces absent from traditional SCADA architectures: the agent can be hijacked via prompt injection, sensor data can be spoofed to mislead agent reasoning, and server-side physics code can be tampered to mask anomalies. We present \physattest{}, a 13-component defense framework that grounds all security decisions in physical laws rather than learned models. The architecture deploys five coordinated LangGraph agents---Overseer, Sentinel, Prober, Fingerprint, and Guardian---protected by a Control Barrier Function (CBF) safety filter that no text input can bypass. We prove three formal theorems: (1)~a Stackelberg game showing the attacker's optimal strategy achieves exactly the information-theoretic impossibility bound $I^* = \frac{1}{2}\log\det(I + K^{-1}\Sigma)$; (2)~a Neyman--Pearson bound on fingerprint evasion $\Prob(\text{evasion}) \le \exp(-n \cdot \KL)$; and (3)~Byzantine fault tolerance guaranteeing safety with up to two compromised agents. Evaluation on a SWaT-derived testbed achieves F1$=$0.79 at threshold $\tau{=}2.5$ with a three-tier LLM fallback chain (Groq$\to$TinyLlama$\to$hardcoded rules) that ensures classification never depends on any LLM. The CBF safety filter, implemented as a CVXPY quadratic program, blocks 100\% of overflow attacks regardless of agent compromise.
+Agentic IoT systems that use large language model (LLM) agents for autonomous decision-making introduce attack surfaces absent from traditional SCADA architectures: the agent can be hijacked via prompt injection, sensor data can be spoofed to mislead agent reasoning, and server-side physics code can be tampered to mask anomalies. We present \physattest{}, a 13-component defense framework that grounds all security decisions in physical laws rather than learned models. The architecture deploys five coordinated LangGraph agents---Overseer, Sentinel, Prober, Fingerprint, and Guardian---protected by a Control Barrier Function (CBF) safety filter that no text input can bypass. We prove three formal theorems: (1)~a Stackelberg game showing the attacker's optimal strategy achieves exactly the information-theoretic impossibility bound $I^* = \frac{1}{2}\log\det(I + K^{-1}\Sigma)$; (2)~a Neyman--Pearson bound on fingerprint evasion $\Prob(\text{evasion}) \le \exp(-n \cdot \KL)$; and (3)~Byzantine fault tolerance guaranteeing safety with up to two compromised agents. Evaluation on the real SWaT dataset (449{,}919 samples, 35 attacks) achieves 0.34\% FPR and 87.9\% accuracy with Shewhart+CUSUM+Bias three-layer detection. On a synthetic testbed, F1$=$0.79 at $\tau{=}2.5$ with a three-tier LLM fallback chain (Groq$\to$TinyLlama$\to$hardcoded rules) that ensures classification never depends on any LLM. The CBF safety filter, implemented as a CVXPY quadratic program, blocks 100\% of overflow attacks regardless of agent compromise.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -394,11 +396,13 @@ Let $\mathcal{A} = \{\text{Sentinel, Prober, Fingerprint, Guardian}\}$ be the de
 
 \subsection{Experimental Setup}
 
-We evaluate \physattest{} on a SWaT-derived testbed with 22 continuous sensors, 6 actuators, and 15 attack scenarios drawn from the SWaT dataset attack catalogue~\cite{goh2017dataset}. All experiments run on a standard laptop (CPU only) using CVXPY, LangGraph, SciPy, and NumPy.
+We evaluate \physattest{} on two datasets: (i)~the real SWaT dataset from iTrust SUTD~\cite{goh2017dataset} (51 sensors, 449{,}919 attack samples with 35 labelled attack periods, obtained under NDA), and (ii)~a synthetic SWaT testbed with 22 continuous sensors and 13 attack scenarios for ablation studies. All experiments run on a standard laptop (CPU only) using CVXPY, LangGraph, SciPy, and NumPy.
 
-\subsection{Detection Performance}
+On the real SWaT dataset, the multi-domain observer (Layer~1) with Shewhart+CUSUM+Bias three-layer detection achieves precision 0.316 at FPR 0.0034 and accuracy 0.879, using 5 of 7 active detection states (pH and ORP are auto-excluded due to systematic model mismatch). The strongest single-attack result is Attack~12 (84.1\% recall, 100\% precision, 28s delay). The overall low recall (1.2\%) is expected: the Layer~1 observer covers only hydraulic and conductivity states; the remaining states require SINDy Layer~2 refinement (now wired in) and the anomaly transformer (Component~6).
 
-Table~\ref{tab:detection_metrics} shows the precision-recall tradeoff across detection thresholds. The best F1 score of 0.79 is achieved at threshold $\tau = 2.5$, with precision 0.84 and recall 0.75.
+\subsection{Detection Performance (Synthetic)}
+
+Table~\ref{tab:detection_metrics} shows the precision-recall tradeoff across detection thresholds on synthetic data. The best F1 score of 0.79 is achieved at threshold $\tau = 2.5$, with precision 0.84 and recall 0.75.
 
 \input{../physattest/experiments/output/tables/tab_detection_metrics}
 
@@ -446,9 +450,9 @@ The full end-to-end demo runs all 13 components through 136 agent cycles in unde
 \section{Conclusion}
 \label{sec:conclusion}
 
-We presented \physattest{}, a 13-component defense framework for agentic IoT systems that grounds all security decisions in physical laws. The framework simultaneously addresses sensor spoofing, LLM agent hijacking, and server code tampering through five coordinated LangGraph agents protected by a CBF safety filter. Three formal theorems establish the system's security guarantees: a game-theoretic impossibility bound, an exponentially decaying fingerprint evasion bound, and Byzantine fault tolerance with up to two compromised agents. Evaluation on a SWaT-derived testbed demonstrates F1$=$0.79 detection performance with the CBF blocking all overflow attacks, running entirely on CPU in under 2~seconds.
+We presented \physattest{}, a 13-component defense framework for agentic IoT systems that grounds all security decisions in physical laws. The framework simultaneously addresses sensor spoofing, LLM agent hijacking, and server code tampering through five coordinated LangGraph agents protected by a CBF safety filter. Three formal theorems establish the system's security guarantees: a game-theoretic impossibility bound, an exponentially decaying fingerprint evasion bound, and Byzantine fault tolerance with up to two compromised agents. Evaluation on the real SWaT dataset demonstrates 87.9\% accuracy and 0.34\% FPR with the three-layer detector, while synthetic experiments achieve F1$=$0.79 with the CBF blocking all overflow attacks, running entirely on CPU in under 2~seconds.
 
-Future work includes: (i)~deploying on a physical testbed with real ADC noise fingerprints, (ii)~extending the Stackelberg game to multi-round repeated interactions, and (iii)~investigating adaptive thresholds that learn plant-specific noise profiles during operation.
+Future work includes: (i)~completing SINDy Layer~2 integration to recover pH/ORP detection, (ii)~training the anomaly transformer on real SWaT residuals, (iii)~extending the Stackelberg game to multi-round repeated interactions, and (iv)~deploying on a physical testbed with real ADC noise fingerprints.
 
 
 %% ================================================================

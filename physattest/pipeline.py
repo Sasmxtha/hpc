@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
 from data.loader import SWaTLoader
+from data.swat_config import ALL_SENSORS, ACTUATORS, CONTINUOUS_SENSORS
 from observer.multi_domain_observer import (
     MultiDomainObserver, N_STATES, N_INPUTS,
     STATE_H1, STATE_H3, STATE_H4, STATE_PH, STATE_ORP, STATE_COND, STATE_DP3,
@@ -34,7 +35,6 @@ from observer.healing import SelfHealingFunction, CompromiseType
 # Column-to-observer mapping
 # -----------------------------------------------------------------------
 
-# Maps SWaT data columns → observer state indices
 SENSOR_TO_STATE = {
     "LIT101":  STATE_H1,
     "LIT301":  STATE_H3,
@@ -45,9 +45,8 @@ SENSOR_TO_STATE = {
     "DPIT301": STATE_DP3,
 }
 
-# Maps SWaT data columns → observer input indices
 ACTUATOR_TO_INPUT = {
-    "MV101":  (INPUT_MV101, 2),   # (index, "on" value — MV101=2 means open)
+    "MV101":  (INPUT_MV101, 2),
     "P101":   (INPUT_P101, 2),
     "P201":   (INPUT_P201, 2),
     "P301":   (INPUT_P301, 2),
@@ -57,16 +56,14 @@ ACTUATOR_TO_INPUT = {
     "UV401":  (INPUT_UV401, 2),
 }
 
-# Normalization: convert data units to observer units
-# Observer uses meters for level; SWaT data uses millimeters
 UNIT_SCALE = {
-    "LIT101": 0.001,    # mm → m
+    "LIT101": 0.001,    # mm -> m
     "LIT301": 0.001,
     "LIT401": 0.001,
-    "AIT201": 1.0,      # pH is pH
-    "AIT202": 1.0,      # mV is mV
-    "AIT203": 1.0,      # µS/cm
-    "DPIT301": 0.01,    # kPa → bar (approximate)
+    "AIT201": 1.0,
+    "AIT202": 1.0,
+    "AIT203": 1.0,
+    "DPIT301": 0.01,
 }
 
 
@@ -79,7 +76,7 @@ class DetectionResult:
     residual_math: float
     residual_combined: float
     is_detected: bool
-    true_label: bool        # ground truth: is this actually an attack?
+    true_label: bool
     healed_sensors: List[str] = field(default_factory=list)
 
 
@@ -90,11 +87,11 @@ class AttackMetrics:
     attack_start: int
     attack_end: int
     duration: int
-    tp: int = 0             # true positives (attack detected during attack)
-    fp: int = 0             # false positives (detected but no attack)
-    fn: int = 0             # false negatives (attack but not detected)
-    tn: int = 0             # true negatives (no attack, not detected)
-    detection_delay: int = -1   # seconds from attack start to first detection (-1 = missed)
+    tp: int = 0
+    fp: int = 0
+    fn: int = 0
+    tn: int = 0
+    detection_delay: int = -1
     precision: float = 0.0
     recall: float = 0.0
     f1: float = 0.0
@@ -107,8 +104,8 @@ class PhysAttestPipeline:
     Steps each second:
       1. Read sensor data from the loader
       2. Map columns to observer state/input vectors
-      3. Run observer → get residuals
-      4. Apply threshold detection (3-sigma from training)
+      3. Run observer -> get residuals
+      4. Apply three-layer detection (Shewhart + CUSUM + Bias)
       5. If detected: flag sensor, run healer
       6. Record result for metrics
     """
@@ -119,7 +116,6 @@ class PhysAttestPipeline:
         self.coupling_graph = build_swat_coupling_graph()
         self.healer = SelfHealingFunction(self.coupling_graph)
 
-        # Per-domain thresholds (on norm of residual vector)
         self.thresholds = {
             "physics": None,
             "chemistry": None,
@@ -127,35 +123,28 @@ class PhysAttestPipeline:
             "combined": None,
         }
 
-        # Per-state thresholds (on individual residual components)
-        # This is the primary detector — handles model mismatch gracefully
         self.state_thresholds = np.zeros(N_STATES)
         self.state_means = np.zeros(N_STATES)
         self.state_stds = np.zeros(N_STATES)
 
-    def calibrate(self, normal_data_path: str, max_rows: int = 86400,
+    def calibrate(self, data_dir: str, max_rows: int = 86400,
                   warmup: int = 3600):
         """
         Learn detection thresholds from normal (attack-free) data.
 
-        Runs the observer on normal data to measure baseline residual
-        distribution. Skips a warmup period so the observer reaches
-        steady state before measuring thresholds.
-
-        Threshold = mean + threshold_sigma × std.
+        Threshold = mean + threshold_sigma * std.
         """
         print("Calibrating thresholds from normal data...")
-        loader = SWaTLoader(normal_data_path, max_rows=max_rows)
-        df = loader.df
+        loader = SWaTLoader(data_dir=data_dir)
+        normal_df, _ = loader.load()
+        df = normal_df.head(max_rows)
 
-        sensor_names = loader.get_sensor_names()
-        actuator_names = loader.get_actuator_names()
+        sensor_names = [c for c in ALL_SENSORS if c in df.columns]
+        actuator_names = [c for c in ACTUATORS if c in df.columns]
 
-        # Initialize observer with first reading
         y0 = self._extract_state(df.iloc[0], sensor_names)
         self.observer.initialize(y0)
 
-        # Collect residuals on normal data (skip warmup)
         residuals = {"physics": [], "chemistry": [], "math": [], "combined": []}
         per_state_residuals = []
         per_state_signed = []
@@ -171,24 +160,18 @@ class PhysAttestPipeline:
                 per_state_residuals.append(np.abs(result["combined"]))
                 per_state_signed.append(result["combined"].copy())
 
-        # Set domain-level thresholds (on norm)
         for domain in self.thresholds:
             vals = np.array(residuals[domain])
             mean = np.mean(vals)
             std = np.std(vals)
             self.thresholds[domain] = mean + self.threshold_sigma * std
 
-        # Set per-state thresholds (on individual absolute residual components)
-        per_state_residuals = np.array(per_state_residuals)  # (n_samples, N_STATES)
+        per_state_residuals = np.array(per_state_residuals)
         self.state_means = np.mean(per_state_residuals, axis=0)
         self.state_stds = np.std(per_state_residuals, axis=0)
         self.state_stds = np.maximum(self.state_stds, 1e-6)
         self.state_thresholds = self.state_means + self.threshold_sigma * self.state_stds
 
-        # Signed residual statistics for the bias detector.
-        # Under normal operation, signed residuals may have nonzero mean
-        # (model bias). The bias detector flags when the window mean
-        # shifts AWAY from this baseline.
         self.signed_means = np.mean(per_state_signed, axis=0)
         self.signed_stds = np.std(per_state_signed, axis=0)
         self.signed_stds = np.maximum(self.signed_stds, 1e-6)
@@ -201,15 +184,10 @@ class PhysAttestPipeline:
         state_names = ["h1", "h3", "h4", "pH", "ORP", "cond", "dP"]
         print(f"  Per-state thresholds:")
 
-        # Determine which states have a calibrated model (useful for detection)
-        # vs constant offset (model mismatch — not useful for z-score detection).
-        # A state where std/mean < 0.05 has a big constant residual with little
-        # variation — the observer model is systematically wrong. That state
-        # still runs in the observer but its z-score isn't used for detection.
         self.active_detection_states = []
         for i, name in enumerate(state_names):
             ratio = self.state_stds[i] / max(abs(self.state_means[i]), 1e-9)
-            is_active = ratio > 0.05
+            is_active = ratio > 0.10
             self.active_detection_states.append(is_active)
             status = "ACTIVE" if is_active else "SKIP (model mismatch)"
             print(f"    {name:6s}: mean={self.state_means[i]:.6f}  "
@@ -221,35 +199,27 @@ class PhysAttestPipeline:
 
         return self.thresholds
 
-    def run(self, attack_data_path: str, max_rows: Optional[int] = None) -> Dict:
+    def run(self, data_dir: str, max_rows: Optional[int] = None) -> Dict:
         """
         Run the full pipeline on attack data.
-
-        Returns a dictionary with:
-            'detections': list of DetectionResult per timestep
-            'attack_metrics': list of AttackMetrics per attack period
-            'overall': overall precision, recall, F1
         """
         if self.thresholds["combined"] is None:
             raise RuntimeError("Must call calibrate() before run()")
 
-        loader = SWaTLoader(attack_data_path, max_rows=max_rows)
-        df = loader.df
-        sensor_names = loader.get_sensor_names()
-        actuator_names = loader.get_actuator_names()
+        loader = SWaTLoader(data_dir=data_dir)
+        _, attack_df = loader.load()
+        df = attack_df.head(max_rows) if max_rows else attack_df
+        sensor_names = [c for c in ALL_SENSORS if c in df.columns]
+        actuator_names = [c for c in ACTUATORS if c in df.columns]
 
-        # Get attack periods for per-attack metrics
-        attack_periods = loader.get_attack_periods()
+        attack_periods = self._extract_attack_periods(df)
 
-        # Reset observer
         self.observer = MultiDomainObserver(dt=1.0)
         y0 = self._extract_state(df.iloc[0], sensor_names)
         self.observer.initialize(y0)
 
-        # Reset healer
         self.healer = SelfHealingFunction(self.coupling_graph)
 
-        # Warmup: let the observer converge before detecting
         warmup = 3600
         n_rows = len(df)
         for i in range(1, min(warmup, n_rows)):
@@ -257,33 +227,30 @@ class PhysAttestPipeline:
             u = self._extract_input(df.iloc[i], actuator_names)
             self.observer.step(y, u)
 
-        # Run detection after warmup
+        # SINDy Layer 2: refine observer matrices from warmup trajectory
+        try:
+            sindy_result = self.observer.refine_with_sindy(min_samples=300)
+            if sindy_result is not None:
+                print(f"  SINDy Layer 2: refined A/B matrices (R²={sindy_result['score']:.4f})")
+        except Exception as e:
+            print(f"  SINDy Layer 2: skipped ({e})")
+
+        # Three-layer detector (Shewhart + CUSUM + Bias)
         detections: List[DetectionResult] = []
 
-        # Three-layer detector (Shewhart + CUSUM + Bias).
-        #
-        # Layer 1 - Shewhart: instant alert for large spikes (z > 5sigma).
-        # Layer 2 - CUSUM: accumulates small persistent deviations.
-        # Layer 3 - Bias: sliding window mean of SIGNED residuals.
-        #   Even when Kalman absorbs most of an attack, the residual
-        #   stays consistently biased in one direction. Under normal
-        #   operation, the signed mean over a window is ~0.
         INSTANT_SIGMA = 5.0
         CUSUM_DRIFT = 0.5
         CUSUM_BOUNDARY = 8.0
         CUSUM_DECAY = 0.99
-        BIAS_WINDOW = 60            # seconds of signed residual to average
-        BIAS_SIGMA = 3.5            # signed mean exceeds this many sigma
+        BIAS_WINDOW = 60
+        BIAS_SIGMA = 3.5
 
         cusum_pos = np.zeros(N_STATES)
         cusum_neg = np.zeros(N_STATES)
-        # Ring buffer for signed residuals (for bias detection)
         signed_buffer = np.zeros((BIAS_WINDOW, N_STATES))
         buf_idx = 0
         buf_filled = False
 
-        # Bias threshold: std of the window-mean of signed residuals.
-        # For i.i.d. noise with std=s, mean over N samples has std = s/sqrt(N).
         bias_std = self.signed_stds / np.sqrt(BIAS_WINDOW)
 
         for i in range(max(1, warmup), n_rows):
@@ -298,7 +265,6 @@ class PhysAttestPipeline:
             r_math = np.linalg.norm(result["math"])
             r_comb = np.linalg.norm(result["combined"])
 
-            # Signed residual (keeps direction information)
             signed_residual = result["combined"]
             abs_residual = np.abs(signed_residual)
             z_scores = (abs_residual - self.state_means) / self.state_stds
@@ -316,19 +282,19 @@ class PhysAttestPipeline:
             if buf_idx == 0:
                 buf_filled = True
 
-            # Layer 1: Shewhart
+            # Layer 1: Shewhart (instant spike)
             instant_alert = any(
                 z_scores[s] > INSTANT_SIGMA
                 for s in range(N_STATES)
                 if self.active_detection_states[s]
             )
-            # Layer 2: CUSUM
+            # Layer 2: CUSUM (accumulated drift)
             cusum_alert = any(
                 (cusum_pos[s] > CUSUM_BOUNDARY or cusum_neg[s] > CUSUM_BOUNDARY)
                 for s in range(N_STATES)
                 if self.active_detection_states[s]
             )
-            # Layer 3: Bias (signed window mean shifted from calibrated baseline)
+            # Layer 3: Bias (signed window mean shifted from baseline)
             bias_alert = False
             if buf_filled:
                 window_mean = np.mean(signed_buffer, axis=0)
@@ -339,9 +305,21 @@ class PhysAttestPipeline:
                     if self.active_detection_states[s]
                 )
 
-            is_detected = instant_alert or cusum_alert or bias_alert
+            # Domain-level detection: physics residual norm exceeds threshold
+            domain_alert = r_phys > self.thresholds["physics"] * 3.0
+
+            is_detected = instant_alert or cusum_alert or bias_alert or domain_alert
 
             true_label = bool(row.get("is_attack", False))
+
+            healed = []
+            if is_detected:
+                idx_to_sensor = {v: k for k, v in SENSOR_TO_STATE.items()}
+                flagged_states = [
+                    s for s in range(N_STATES)
+                    if self.active_detection_states[s] and z_scores[s] > INSTANT_SIGMA
+                ]
+                healed = [idx_to_sensor[s] for s in flagged_states if s in idx_to_sensor]
 
             detections.append(DetectionResult(
                 timestamp=i,
@@ -351,9 +329,9 @@ class PhysAttestPipeline:
                 residual_combined=r_comb,
                 is_detected=is_detected,
                 true_label=true_label,
+                healed_sensors=healed,
             ))
 
-        # Compute metrics
         attack_metrics = self._compute_attack_metrics(detections, attack_periods)
         overall = self._compute_overall_metrics(detections)
 
@@ -363,6 +341,34 @@ class PhysAttestPipeline:
             "overall": overall,
             "thresholds": dict(self.thresholds),
         }
+
+    @staticmethod
+    def _extract_attack_periods(df: "pd.DataFrame") -> List[Dict]:
+        """Extract contiguous attack windows from the is_attack column."""
+        periods = []
+        in_attack = False
+        start = 0
+        for i in range(len(df)):
+            is_atk = bool(df.iloc[i].get("is_attack", False))
+            if is_atk and not in_attack:
+                start = i
+                in_attack = True
+            elif not is_atk and in_attack:
+                periods.append({
+                    "start": start,
+                    "end": i - 1,
+                    "duration": i - start,
+                    "label": f"Attack_{len(periods)+1}",
+                })
+                in_attack = False
+        if in_attack:
+            periods.append({
+                "start": start,
+                "end": len(df) - 1,
+                "duration": len(df) - start,
+                "label": f"Attack_{len(periods)+1}",
+            })
+        return periods
 
     def _extract_state(self, row, sensor_names: List[str]) -> np.ndarray:
         """Map a data row to the observer's 7-state vector."""
@@ -384,13 +390,9 @@ class PhysAttestPipeline:
         return u
 
     def _identify_flagged_sensor(self, result: Dict) -> Optional[str]:
-        """
-        Find which sensor contributed most to the residual spike.
-        Returns the sensor name with the largest absolute residual.
-        """
+        """Find which sensor contributed most to the residual spike."""
         combined = result["combined"]
         max_idx = np.argmax(np.abs(combined))
-
         idx_to_sensor = {v: k for k, v in SENSOR_TO_STATE.items()}
         return idx_to_sensor.get(max_idx)
 
@@ -403,7 +405,7 @@ class PhysAttestPipeline:
         metrics_list = []
 
         for period in attack_periods:
-            start = period["start"] - 1   # offset by 1 (we skip row 0)
+            start = period["start"] - 1
             end = period["end"] - 1
             label = period["label"]
             duration = period["duration"]
@@ -428,10 +430,8 @@ class PhysAttestPipeline:
                 elif in_attack and not det.is_detected:
                     m.fn += 1
                 elif not in_attack and det.is_detected:
-                    # Only count FP near this attack (within 60s buffer)
                     if abs(t - start) < 60 or abs(t - end) < 60:
                         m.fp += 1
-                # TN counted in overall metrics
 
             m.detection_delay = first_detection
 
@@ -475,7 +475,6 @@ class PhysAttestPipeline:
         print("PhysAttest Detection Results")
         print("=" * 80)
 
-        # Overall metrics
         o = results["overall"]
         print(f"\n--- Overall Performance ---")
         print(f"  Precision:  {o['precision']:.4f}  (of detections, how many were real attacks)")
@@ -485,7 +484,6 @@ class PhysAttestPipeline:
         print(f"  FPR:        {o['fpr']:.4f}  (false positive rate)")
         print(f"  TP={o['tp']}  FP={o['fp']}  FN={o['fn']}  TN={o['tn']}")
 
-        # Per-attack table
         print(f"\n--- Per-Attack Metrics ---")
         print(f"  {'Attack':<20s} {'Recall':>8s} {'Precision':>10s} "
               f"{'F1':>8s} {'Delay':>8s} {'TP':>6s} {'FN':>6s}")
@@ -496,7 +494,6 @@ class PhysAttestPipeline:
             print(f"  {m.attack_label:<20s} {m.recall:>8.3f} {m.precision:>10.3f} "
                   f"{m.f1:>8.3f} {delay_str:>8s} {m.tp:>6d} {m.fn:>6d}")
 
-        # Thresholds
         print(f"\n--- Detection Thresholds ---")
         for domain, thresh in results["thresholds"].items():
             print(f"  {domain:12s}: {thresh:.6f}")
